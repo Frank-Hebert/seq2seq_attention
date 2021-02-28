@@ -50,16 +50,24 @@ class Encoder(nn.Module):
 
         self.dropout = nn.Dropout(p_dropout)
         self.embedding = nn.Embedding(input_size, embedding_size)
-        self.rnn = nn.LSTM(embedding_size, hidden_size, num_layers, dropout=p_dropout)
+        self.rnn = nn.LSTM(embedding_size, hidden_size, num_layers, bidirectional=True)
+
+        self.fc_hidden = nn.Linear(hidden_size * 2, hidden_size)
+        self.fc_cell = nn.Linear(hidden_size * 2, hidden_size)
 
     def forward(self, x):
         # x.shape = (seq_lenght, N)  where N is batch_size
         embedding = self.dropout(self.embedding(x))
         # embedding.shape (seq_length, N, embeddoing_size)
 
-        outputs, (hidden, cell) = self.rnn(embedding)
+        encoder_states, (hidden, cell) = self.rnn(embedding)
 
-        return hidden, cell
+        # hidden shape : (2, N, hidden_size)
+        hidden = self.fc_hidden(torch.cat((hidden[0:1], hidden[1:2]), dim=2))
+
+        cell = self.fc_cell(torch.cat((cell[0:1], cell[1:2]), dim=2))
+
+        return encoder_states, hidden, cell
 
 
 class Decoder(nn.Module):
@@ -77,17 +85,36 @@ class Decoder(nn.Module):
         self.num_layers = num_layers
         self.dropout = nn.Dropout(p_dropout)
         self.embedding = nn.Embedding(input_size, embedding_size)
-        self.rnn = nn.LSTM(embedding_size, hidden_size, num_layers, dropout=p_dropout)
+        self.rnn = nn.LSTM(hidden_size * 2 + embedding_size, hidden_size, num_layers)
+
+        self.energy = nn.Linear(hidden_size * 3, 1)
+        self.softmax = nn.Softmax(dim=0)
+        self.relu = nn.ReLU()
         self.fc = nn.Linear(hidden_size, output_size)
 
-    def forward(self, x, hidden, cell):
+    def forward(self, x, encoder_states, hidden, cell):
         # x.shape = (N) but we want (1,N)
         x = x.unsqueeze(0)
 
         embedding = self.dropout(self.embedding(x))
         # embedding.shape = (1, N, embedding_size)
 
-        outputs, (hidden, cell) = self.rnn(embedding, (hidden, cell))
+        sequence_length = encoder_states.shape[0]
+        h_reshaped = hidden.repeat(sequence_length, 1, 1)
+
+        energy = self.relu(self.energy(torch.cat((h_reshaped, encoder_states), dim=2)))
+
+        attention = self.softmax(energy)
+        # (seq_lenght, N, 1)
+        attention = attention.permute(1, 2, 0)
+        encoder_states = encoder_states.permute(1, 0, 2)
+        # (N, seq_length, hiddensize*2)
+
+        context_vector = torch.bmm(attention, encoder_states).permute(1, 0, 2)
+
+        rnn_input = torch.cat((context_vector, embedding), dim=2)
+
+        outputs, (hidden, cell) = self.rnn(rnn_input, (hidden, cell))
         # outputs.shape = (1, N, hidden_size)
 
         predictions = self.fc(outputs)
@@ -113,13 +140,13 @@ class Seq2Seq(nn.Module):
         target_vocab_size = len(english.vocab)
 
         outputs = torch.zeros(target_len, batch_size, target_vocab_size).to(device)
-        hidden, cell = self.encoder(source)
+        encoder_states, hidden, cell = self.encoder(source)
 
         # Grab start token
         x = target[0]
 
         for t in range(1, target_len):
-            output, hidden, cell = self.decoder(x, hidden, cell)
+            output, hidden, cell = self.decoder(x, encoder_states, hidden, cell)
 
             outputs[t] = output
 
@@ -135,7 +162,7 @@ class Seq2Seq(nn.Module):
 ### Now we can do the training###
 
 # Training, hyperparameterts
-num_epochs = 20
+num_epochs = 100
 learning_rate = 0.001
 batch_size = 64
 
@@ -149,7 +176,7 @@ output_size = len(english.vocab)
 encoder_embedding_size = 300
 decoder_embedding_size = 300
 hidden_size = 1024
-num_layers = 2
+num_layers = 1
 enc_dropout = 0.5
 dec_dropout = 0.5
 
